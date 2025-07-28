@@ -30,13 +30,16 @@ TIMEFRAME_OPTIONS = {
 
 @st.cache_data(show_spinner=False)
 def fetch_stock_data(symbol: str, period: str, interval: str):
-    data = yf.download(symbol, period=period, interval=interval, progress=False)
-    if data.empty:
-        st.warning("No data returned from Yahoo Finance – showing simulated data instead.")
+    try:
+        data = yf.download(symbol, period=period, interval=interval, progress=False)
+        if data.empty:
+            st.warning("No data returned from Yahoo Finance – showing simulated data instead.")
+            return None
+        data.reset_index(inplace=True)
+        return data
+    except Exception as e:
+        st.error(f"Error fetching data: {e}")
         return None
-    data.reset_index(inplace=True)
-    data.rename(columns={'Volume': 'Volume'}, inplace=True)
-    return data
 
 # ===================== Prediction Engine =====================
 class SimplePredictor:
@@ -48,51 +51,71 @@ class SimplePredictor:
                 'confidence': 50,
                 'expected_change': 0
             }
-        close = df['Close']
-        sma_short = close.rolling(10).mean().iloc[-1]
-        sma_long = close.rolling(30).mean().iloc[-1]
-        rsi = self._rsi(close).iloc[-1]
+        
+        try:
+            close = df['Close']
+            sma_short = close.rolling(10).mean().iloc[-1]
+            sma_long = close.rolling(30).mean().iloc[-1]
+            rsi = self._rsi(close).iloc[-1]
 
-        # Check for NaN values
-        if pd.isna(sma_short) or pd.isna(sma_long) or pd.isna(rsi):
+            # Check for NaN values using numpy
+            if np.isnan(sma_short) or np.isnan(sma_long) or np.isnan(rsi):
+                return {
+                    'signal': 'HOLD',
+                    'confidence': 50,
+                    'expected_change': 0
+                }
+
+            score = 0
+            if sma_short > sma_long:
+                score += 0.4
+            else:
+                score -= 0.4
+            if rsi < 30:
+                score += 0.3
+            elif rsi > 70:
+                score -= 0.3
+            
+            # Check if we have enough data for daily change
+            if len(close) >= 2:
+                daily_change = (close.iloc[-1] - close.iloc[-2]) / close.iloc[-2]
+                if not np.isnan(daily_change):
+                    score += daily_change * 0.3
+
+            if score > 0.3:
+                signal = 'BUY'
+            elif score < -0.3:
+                signal = 'SELL'
+            else:
+                signal = 'HOLD'
+            
+            confidence = min(95, 50 + abs(score) * 100)
+            expected_change = score * 100
+            
+            return {
+                'signal': signal,
+                'confidence': confidence,
+                'expected_change': expected_change
+            }
+        except Exception as e:
+            # Fallback in case of any error
             return {
                 'signal': 'HOLD',
                 'confidence': 50,
                 'expected_change': 0
             }
 
-        score = 0
-        if sma_short > sma_long:
-            score += 0.4
-        else:
-            score -= 0.4
-        if rsi < 30:
-            score += 0.3
-        elif rsi > 70:
-            score -= 0.3
-        daily_change = (close.iloc[-1] - close.iloc[-2]) / close.iloc[-2]
-        score += daily_change * 0.3
-
-        if score > 0.3:
-            signal = 'BUY'
-        elif score < -0.3:
-            signal = 'SELL'
-        else:
-            signal = 'HOLD'
-        confidence = min(95, 50 + abs(score) * 100)
-        expected_change = score * 100
-        return {
-            'signal': signal,
-            'confidence': confidence,
-            'expected_change': expected_change
-        }
-
     def _rsi(self, series: pd.Series, period: int = 14):
-        delta = series.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
+        try:
+            delta = series.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            return rsi.fillna(50)
+        except:
+            # Return neutral RSI if calculation fails
+            return pd.Series([50] * len(series), index=series.index)
 
 predictor = SimplePredictor()
 
@@ -106,33 +129,44 @@ class PortfolioSimulator:
         self.history = []
 
     def run(self, period='6mo'):
-        for symbol in self.symbols:
-            data = yf.download(symbol, period=period, interval='1d', progress=False)
-            if data.empty:
-                continue
-            data.reset_index(inplace=True)
-            for idx in range(30, len(data)):
-                window = data.iloc[:idx]
-                pred = predictor.predict(window)
-                price = data['Close'].iloc[idx]
-                # Simple rule-based trading
-                if pred['signal'] == 'BUY' and self.cash > price:
-                    # buy one share
-                    self.cash -= price
-                    self.positions[symbol] += 1
-                    self.history.append((data['Date'].iloc[idx], symbol, 'BUY', price))
-                elif pred['signal'] == 'SELL' and self.positions[symbol] > 0:
-                    # sell all shares
-                    self.cash += price * self.positions[symbol]
-                    self.history.append((data['Date'].iloc[idx], symbol, 'SELL', price, self.positions[symbol]))
-                    self.positions[symbol] = 0
-        # Final portfolio value
-        final_value = self.cash
-        for symbol, qty in self.positions.items():
-            if qty > 0:
-                last_price = yf.download(symbol, period='1d', interval='1d', progress=False)['Close'][-1]
-                final_value += last_price * qty
-        return final_value
+        try:
+            for symbol in self.symbols:
+                data = yf.download(symbol, period=period, interval='1d', progress=False)
+                if data.empty:
+                    continue
+                data.reset_index(inplace=True)
+                
+                for idx in range(30, len(data)):
+                    window = data.iloc[:idx]
+                    pred = predictor.predict(window)
+                    price = data['Close'].iloc[idx]
+                    
+                    # Simple rule-based trading
+                    if pred['signal'] == 'BUY' and self.cash > price:
+                        # buy one share
+                        self.cash -= price
+                        self.positions[symbol] += 1
+                        self.history.append((data['Date'].iloc[idx], symbol, 'BUY', price))
+                    elif pred['signal'] == 'SELL' and self.positions[symbol] > 0:
+                        # sell all shares
+                        self.cash += price * self.positions[symbol]
+                        self.history.append((data['Date'].iloc[idx], symbol, 'SELL', price, self.positions[symbol]))
+                        self.positions[symbol] = 0
+            
+            # Final portfolio value
+            final_value = self.cash
+            for symbol, qty in self.positions.items():
+                if qty > 0:
+                    try:
+                        last_price = yf.download(symbol, period='1d', interval='1d', progress=False)['Close'][-1]
+                        final_value += last_price * qty
+                    except:
+                        pass  # Skip if can't get current price
+            
+            return final_value
+        except Exception as e:
+            st.error(f"Simulation error: {e}")
+            return self.initial_cash
 
 # ===================== Streamlit UI =====================
 
@@ -141,7 +175,7 @@ def main():
 
     col1, col2 = st.columns([3, 1])
     with col1:
-        symbol = st.text_input("Enter Stock Ticker (e.g., AAPL, TSLA):", value="AAPL")
+        symbol = st.text_input("Enter Stock Ticker (e.g., AAPL, TSLA):", value="AAPL").upper()
     with col2:
         timeframe_label = st.selectbox(
             "Timeframe:", list(TIMEFRAME_OPTIONS.keys()), index=3)
@@ -152,6 +186,7 @@ def main():
     with st.spinner("Fetching data..."):
         data = fetch_stock_data(symbol, period, interval)
         if data is None:
+            st.error("Could not fetch data. Please try a different symbol or timeframe.")
             st.stop()
 
     # Prediction
@@ -161,7 +196,7 @@ def main():
     # Overlay prediction
     st.markdown(f"""
     <h1 style='position:fixed; top:35%; left:50%; transform:translate(-50%, -50%); 
-       font-size:12vw; color:{overlay_color}; opacity:0.1; z-index:0;'>
+       font-size:12vw; color:{overlay_color}; opacity:0.1; z-index:0; pointer-events:none;'>
         {pred['signal']}
     </h1>
     """, unsafe_allow_html=True)
@@ -174,7 +209,13 @@ def main():
         low=data['Low'],
         close=data['Close'],
         name='Market Data'))
-    fig.update_layout(height=700, margin=dict(l=10, r=10, t=30, b=30))
+    fig.update_layout(
+        height=700, 
+        margin=dict(l=10, r=10, t=30, b=30),
+        xaxis_title="Date",
+        yaxis_title="Price ($)",
+        showlegend=False
+    )
     st.plotly_chart(fig, use_container_width=True)
 
     # Tabs for analysis & simulator
@@ -187,28 +228,48 @@ def main():
         colC.metric("Expected Move", f"{pred['expected_change']:+.2f}%")
 
         # RSI chart
-        rsi = predictor._rsi(data['Close']).fillna(50)
+        rsi = predictor._rsi(data['Close'])
         rsi_fig = go.Figure()
-        rsi_fig.add_trace(go.Scatter(x=data['Date'], y=rsi, name='RSI'))
-        rsi_fig.add_hline(y=70, line_color='red', line_dash='dash')
-        rsi_fig.add_hline(y=30, line_color='green', line_dash='dash')
-        rsi_fig.update_layout(height=250, margin=dict(l=10, r=10, t=30, b=10))
+        rsi_fig.add_trace(go.Scatter(x=data['Date'], y=rsi, name='RSI', line=dict(color='blue')))
+        rsi_fig.add_hline(y=70, line_color='red', line_dash='dash', annotation_text="Overbought")
+        rsi_fig.add_hline(y=30, line_color='green', line_dash='dash', annotation_text="Oversold")
+        rsi_fig.update_layout(
+            height=250, 
+            margin=dict(l=10, r=10, t=30, b=10),
+            title="RSI (Relative Strength Index)",
+            yaxis_title="RSI",
+            showlegend=False
+        )
         st.plotly_chart(rsi_fig, use_container_width=True)
 
     with tab2:
-        st.write("### Run Simple Portfolio Simulator (100k USD)")
-        if st.button("Run Simulator"):
-            with st.spinner("Simulating..."):
+        st.write("### Run Simple Portfolio Simulator ($100k USD)")
+        st.write("**Stocks:** TSLA, NVDA, GOOGL, MSFT, AMZN")
+        
+        if st.button("🚀 Run Simulator"):
+            with st.spinner("Simulating trades over the last 6 months..."):
                 sim = PortfolioSimulator(['TSLA', 'NVDA', 'GOOGL', 'MSFT', 'AMZN'])
                 final_value = sim.run(period='6mo')
                 profit = final_value - sim.initial_cash
-                st.success(f"Final Portfolio Value: ${final_value:,.2f}  (Profit: ${profit:,.2f})")
+                profit_pct = (profit / sim.initial_cash) * 100
+                
                 if profit > 0:
+                    st.success(f"🎉 Final Portfolio Value: ${final_value:,.2f}")
+                    st.success(f"💰 Profit: ${profit:,.2f} ({profit_pct:+.1f}%)")
                     st.balloons()
-                # Show simple trade log last 10
+                else:
+                    st.error(f"📉 Final Portfolio Value: ${final_value:,.2f}")
+                    st.error(f"💸 Loss: ${profit:,.2f} ({profit_pct:+.1f}%)")
+                
+                # Show trade history
                 if sim.history:
-                    hist_df = pd.DataFrame(sim.history, columns=['Date', 'Symbol', 'Action', 'Price', 'Qty'])
-                    st.dataframe(hist_df.tail(10))
+                    st.write("### Recent Trades")
+                    hist_df = pd.DataFrame(sim.history)
+                    if len(hist_df.columns) == 4:
+                        hist_df.columns = ['Date', 'Symbol', 'Action', 'Price']
+                    else:
+                        hist_df.columns = ['Date', 'Symbol', 'Action', 'Price', 'Qty']
+                    st.dataframe(hist_df.tail(10), use_container_width=True)
 
 if __name__ == '__main__':
     main()

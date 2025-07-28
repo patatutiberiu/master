@@ -53,6 +53,14 @@ class SimplePredictor:
         sma_long = close.rolling(30).mean().iloc[-1]
         rsi = self._rsi(close).iloc[-1]
 
+        # Check for NaN values
+        if pd.isna(sma_short) or pd.isna(sma_long) or pd.isna(rsi):
+            return {
+                'signal': 'HOLD',
+                'confidence': 50,
+                'expected_change': 0
+            }
+
         score = 0
         if sma_short > sma_long:
             score += 0.4

@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,537 +5,202 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
+import yfinance as yf
 import time
-import random
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import StandardScaler
 import warnings
 warnings.filterwarnings('ignore')
 
-# Page configuration
 st.set_page_config(
-    page_title="AI Stock Prediction",
+    page_title="AI Stock Prediction Pro",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# Custom CSS for the prediction overlay and styling
-st.markdown("""
-<style>
-    .main-container {
-        position: relative;
-        min-height: 80vh;
-    }
+# ===================== Utility Functions =====================
+TIMEFRAME_OPTIONS = {
+    '5 minutes':  ('1d',  '5m'),
+    '15 minutes': ('5d',  '15m'),
+    '1 hour':     ('1mo', '60m'),
+    '1 day':      ('6mo', '1d'),
+    '1 week':     ('1y',  '1wk'),
+    '1 month':    ('2y',  '1mo'),
+    '6 months':   ('6mo', '1d')
+}
 
-    .prediction-overlay {
-        position: fixed;
-        top: 50%;
-        left: 50%;
-        transform: translate(-50%, -50%);
-        font-size: 8vw;
-        font-weight: bold;
-        color: rgba(128, 128, 128, 0.15);
-        z-index: 1;
-        pointer-events: none;
-        text-transform: uppercase;
-        user-select: none;
-    }
+@st.cache_data(show_spinner=False)
+def fetch_stock_data(symbol: str, period: str, interval: str):
+    data = yf.download(symbol, period=period, interval=interval, progress=False)
+    if data.empty:
+        st.warning("No data returned from Yahoo Finance – showing simulated data instead.")
+        return None
+    data.reset_index(inplace=True)
+    data.rename(columns={'Volume': 'Volume'}, inplace=True)
+    return data
 
-    .bullish-overlay {
-        color: rgba(0, 255, 0, 0.15) !important;
-    }
+# ===================== Prediction Engine =====================
+class SimplePredictor:
+    """Very lightweight heuristic predictor for demo purposes"""
+    def predict(self, df: pd.DataFrame):
+        if len(df) < 50:
+            return {
+                'signal': 'HOLD',
+                'confidence': 50,
+                'expected_change': 0
+            }
+        close = df['Close']
+        sma_short = close.rolling(10).mean().iloc[-1]
+        sma_long = close.rolling(30).mean().iloc[-1]
+        rsi = self._rsi(close).iloc[-1]
 
-    .bearish-overlay {
-        color: rgba(255, 0, 0, 0.15) !important;
-    }
-
-    .analysis-panel {
-        position: relative;
-        z-index: 2;
-        background: rgba(255, 255, 255, 0.95);
-        border-radius: 10px;
-        padding: 20px;
-        margin: 10px 0;
-    }
-
-    .metric-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 20px;
-        border-radius: 10px;
-        color: white;
-        text-align: center;
-        margin: 10px 0;
-    }
-
-    .focus-mode {
-        position: fixed;
-        top: 0;
-        left: 0;
-        width: 100vw;
-        height: 100vh;
-        background: rgba(0, 0, 0, 0.95);
-        z-index: 1000;
-        padding: 20px;
-        overflow-y: auto;
-    }
-
-    .stSelectbox > div > div {
-        background-color: #f0f2f6;
-    }
-
-    .prediction-confidence {
-        font-size: 24px;
-        font-weight: bold;
-        text-align: center;
-        padding: 15px;
-        border-radius: 10px;
-        margin: 10px 0;
-    }
-
-    .high-confidence {
-        background: linear-gradient(135deg, #4CAF50, #45a049);
-        color: white;
-    }
-
-    .medium-confidence {
-        background: linear-gradient(135deg, #FF9800, #F57C00);
-        color: white;
-    }
-
-    .low-confidence {
-        background: linear-gradient(135deg, #f44336, #d32f2f);
-        color: white;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-class StockPredictionSystem:
-    def __init__(self):
-        self.model = RandomForestRegressor(n_estimators=100, random_state=42)
-        self.scaler = StandardScaler()
-        self.is_trained = False
-
-        # Popular stocks for demo
-        self.stock_list = {
-            'AAPL': 'Apple Inc.',
-            'GOOGL': 'Alphabet Inc.',
-            'MSFT': 'Microsoft Corporation',
-            'TSLA': 'Tesla Inc.',
-            'AMZN': 'Amazon.com Inc.',
-            'NVDA': 'NVIDIA Corporation',
-            'META': 'Meta Platforms Inc.',
-            'NFLX': 'Netflix Inc.',
-            'AMD': 'Advanced Micro Devices',
-            'UBER': 'Uber Technologies'
-        }
-
-    def generate_stock_data(self, symbol, days=90):
-        """Generate realistic stock data for demo"""
-        np.random.seed(hash(symbol) % 1000)  # Consistent data per symbol
-
-        dates = pd.date_range(start=datetime.now() - timedelta(days=days), 
-                             end=datetime.now(), freq='D')
-
-        # Base price varies by stock
-        base_prices = {
-            'AAPL': 180, 'GOOGL': 140, 'MSFT': 340, 'TSLA': 250,
-            'AMZN': 140, 'NVDA': 450, 'META': 320, 'NFLX': 450,
-            'AMD': 110, 'UBER': 45
-        }
-
-        base_price = base_prices.get(symbol, 100)
-        prices = [base_price]
-
-        for i in range(1, len(dates)):
-            change = np.random.normal(0, base_price * 0.02)
-            new_price = max(prices[-1] + change, base_price * 0.5)
-            prices.append(new_price)
-
-        stock_data = []
-        for i, date in enumerate(dates):
-            open_price = prices[i]
-            close_price = prices[i] + np.random.normal(0, base_price * 0.01)
-            high_price = max(open_price, close_price) + abs(np.random.normal(0, base_price * 0.015))
-            low_price = min(open_price, close_price) - abs(np.random.normal(0, base_price * 0.015))
-            volume = np.random.randint(1000000, 50000000)
-
-            stock_data.append({
-                'Date': date,
-                'Open': open_price,
-                'High': high_price,
-                'Low': low_price,
-                'Close': close_price,
-                'Volume': volume
-            })
-
-        return pd.DataFrame(stock_data)
-
-    def generate_sentiment_data(self, symbol, days=30):
-        """Generate social media sentiment data"""
-        np.random.seed(hash(symbol + 'sentiment') % 1000)
-
-        sources = ['News', 'Twitter', 'Reddit', 'TikTok', 'Instagram', 'Facebook']
-        sentiment_data = []
-
-        dates = pd.date_range(start=datetime.now() - timedelta(days=days), 
-                             end=datetime.now(), freq='D')
-
-        for date in dates:
-            for source in sources:
-                # Different sentiment patterns per source
-                if source == 'News':
-                    sentiment = np.random.normal(0.1, 0.3)
-                elif source == 'Twitter':
-                    sentiment = np.random.normal(0, 0.4)
-                elif source == 'Reddit':
-                    sentiment = np.random.normal(-0.05, 0.35)
-                elif source == 'TikTok':
-                    sentiment = np.random.normal(0.15, 0.4)
-                elif source == 'Instagram':
-                    sentiment = np.random.normal(0.2, 0.25)
-                else:  # Facebook
-                    sentiment = np.random.normal(0.05, 0.3)
-
-                sentiment = max(-1, min(1, sentiment))
-                mentions = np.random.poisson(100)
-                engagement = mentions * np.random.randint(10, 100)
-
-                sentiment_data.append({
-                    'Date': date,
-                    'Source': source,
-                    'Sentiment': sentiment,
-                    'Mentions': mentions,
-                    'Engagement': engagement
-                })
-
-        return pd.DataFrame(sentiment_data)
-
-    def calculate_technical_indicators(self, df):
-        """Calculate technical indicators"""
-        df = df.copy()
-
-        # Moving averages
-        df['SMA_10'] = df['Close'].rolling(10).mean()
-        df['SMA_20'] = df['Close'].rolling(20).mean()
-        df['SMA_50'] = df['Close'].rolling(50).mean()
-
-        # RSI
-        delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / loss
-        df['RSI'] = 100 - (100 / (1 + rs))
-
-        # MACD
-        ema_12 = df['Close'].ewm(span=12).mean()
-        ema_26 = df['Close'].ewm(span=26).mean()
-        df['MACD'] = ema_12 - ema_26
-        df['MACD_Signal'] = df['MACD'].ewm(span=9).mean()
-
-        # Bollinger Bands
-        df['BB_Middle'] = df['Close'].rolling(20).mean()
-        bb_std = df['Close'].rolling(20).std()
-        df['BB_Upper'] = df['BB_Middle'] + (bb_std * 2)
-        df['BB_Lower'] = df['BB_Middle'] - (bb_std * 2)
-
-        return df.fillna(0)
-
-    def make_prediction(self, stock_data, sentiment_data):
-        """Make stock prediction"""
-        # Simple prediction logic for demo
-        recent_price_change = (stock_data['Close'].iloc[-1] - stock_data['Close'].iloc[-5]) / stock_data['Close'].iloc[-5]
-        avg_sentiment = sentiment_data['Sentiment'].mean()
-        recent_volume = stock_data['Volume'].iloc[-5:].mean()
-
-        # Combine factors
-        prediction_score = (recent_price_change * 0.4) + (avg_sentiment * 0.6)
-
-        # Determine signal
-        if prediction_score > 0.02:
-            signal = "STRONG BUY"
-            confidence = min(95, 70 + abs(prediction_score) * 100)
-        elif prediction_score > 0.005:
-            signal = "BUY"
-            confidence = min(85, 60 + abs(prediction_score) * 100)
-        elif prediction_score < -0.02:
-            signal = "STRONG SELL"
-            confidence = min(95, 70 + abs(prediction_score) * 100)
-        elif prediction_score < -0.005:
-            signal = "SELL"
-            confidence = min(85, 60 + abs(prediction_score) * 100)
+        score = 0
+        if sma_short > sma_long:
+            score += 0.4
         else:
-            signal = "HOLD"
-            confidence = 50 + np.random.randint(0, 20)
+            score -= 0.4
+        if rsi < 30:
+            score += 0.3
+        elif rsi > 70:
+            score -= 0.3
+        daily_change = (close.iloc[-1] - close.iloc[-2]) / close.iloc[-2]
+        score += daily_change * 0.3
 
-        expected_change = prediction_score * 100
-
+        if score > 0.3:
+            signal = 'BUY'
+        elif score < -0.3:
+            signal = 'SELL'
+        else:
+            signal = 'HOLD'
+        confidence = min(95, 50 + abs(score) * 100)
+        expected_change = score * 100
         return {
             'signal': signal,
             'confidence': confidence,
-            'expected_change': expected_change,
-            'current_price': stock_data['Close'].iloc[-1],
-            'avg_sentiment': avg_sentiment
+            'expected_change': expected_change
         }
 
-# Initialize the system
-@st.cache_resource
-def load_prediction_system():
-    return StockPredictionSystem()
+    def _rsi(self, series: pd.Series, period: int = 14):
+        delta = series.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
 
-system = load_prediction_system()
+predictor = SimplePredictor()
 
-# Main app
+# ===================== Portfolio Simulator =====================
+class PortfolioSimulator:
+    def __init__(self, symbols, cash=100_000):
+        self.symbols = symbols
+        self.initial_cash = cash
+        self.cash = cash
+        self.positions = {s: 0 for s in symbols}
+        self.history = []
+
+    def run(self, period='6mo'):
+        for symbol in self.symbols:
+            data = yf.download(symbol, period=period, interval='1d', progress=False)
+            if data.empty:
+                continue
+            data.reset_index(inplace=True)
+            for idx in range(30, len(data)):
+                window = data.iloc[:idx]
+                pred = predictor.predict(window)
+                price = data['Close'].iloc[idx]
+                # Simple rule-based trading
+                if pred['signal'] == 'BUY' and self.cash > price:
+                    # buy one share
+                    self.cash -= price
+                    self.positions[symbol] += 1
+                    self.history.append((data['Date'].iloc[idx], symbol, 'BUY', price))
+                elif pred['signal'] == 'SELL' and self.positions[symbol] > 0:
+                    # sell all shares
+                    self.cash += price * self.positions[symbol]
+                    self.history.append((data['Date'].iloc[idx], symbol, 'SELL', price, self.positions[symbol]))
+                    self.positions[symbol] = 0
+        # Final portfolio value
+        final_value = self.cash
+        for symbol, qty in self.positions.items():
+            if qty > 0:
+                last_price = yf.download(symbol, period='1d', interval='1d', progress=False)['Close'][-1]
+                final_value += last_price * qty
+        return final_value
+
+# ===================== Streamlit UI =====================
+
 def main():
-    # Header
-    col1, col2, col3 = st.columns([2, 1, 1])
+    st.title("📈 AI Stock Prediction Pro")
 
-    with col1:
-        st.title("🤖 AI Stock Prediction System")
-
-    with col2:
-        focus_mode = st.button("🎯 Focus Mode", key="focus_btn")
-
-    with col3:
-        auto_refresh = st.checkbox("🔄 Auto Refresh", value=False)
-
-    # Stock selection
     col1, col2 = st.columns([3, 1])
-
     with col1:
-        selected_stock = st.selectbox(
-            "🔍 Select or Search Stock:",
-            options=list(system.stock_list.keys()),
-            format_func=lambda x: f"{x} - {system.stock_list[x]}",
-            key="stock_select"
-        )
-
+        symbol = st.text_input("Enter Stock Ticker (e.g., AAPL, TSLA):", value="AAPL")
     with col2:
-        if st.button("📊 Analyze", type="primary"):
-            st.rerun()
+        timeframe_label = st.selectbox(
+            "Timeframe:", list(TIMEFRAME_OPTIONS.keys()), index=3)
 
-    # Generate data
-    stock_data = system.generate_stock_data(selected_stock)
-    sentiment_data = system.generate_sentiment_data(selected_stock)
-    stock_data = system.calculate_technical_indicators(stock_data)
+    period, interval = TIMEFRAME_OPTIONS[timeframe_label]
 
-    # Make prediction
-    prediction = system.make_prediction(stock_data, sentiment_data)
+    # Fetch data
+    with st.spinner("Fetching data..."):
+        data = fetch_stock_data(symbol, period, interval)
+        if data is None:
+            st.stop()
 
-    # Prediction overlay
-    overlay_class = "bullish-overlay" if "BUY" in prediction['signal'] else "bearish-overlay"
+    # Prediction
+    pred = predictor.predict(data)
+    overlay_color = "green" if pred['signal'] == 'BUY' else "red" if pred['signal'] == 'SELL' else "gray"
+
+    # Overlay prediction
     st.markdown(f"""
-    <div class="prediction-overlay {overlay_class}">
-        {prediction['signal']}
-    </div>
+    <h1 style='position:fixed; top:35%; left:50%; transform:translate(-50%, -50%); 
+       font-size:12vw; color:{overlay_color}; opacity:0.1; z-index:0;'>
+        {pred['signal']}
+    </h1>
     """, unsafe_allow_html=True)
 
-    # Main analysis panel
-    st.markdown('<div class="analysis-panel">', unsafe_allow_html=True)
+    # Candlestick chart – bigger & clearer
+    fig = go.Figure(go.Candlestick(
+        x=data['Date'],
+        open=data['Open'],
+        high=data['High'],
+        low=data['Low'],
+        close=data['Close'],
+        name='Market Data'))
+    fig.update_layout(height=700, margin=dict(l=10, r=10, t=30, b=30))
+    st.plotly_chart(fig, use_container_width=True)
 
-    # Key metrics row
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        confidence_class = "high-confidence" if prediction['confidence'] > 75 else "medium-confidence" if prediction['confidence'] > 50 else "low-confidence"
-        st.markdown(f"""
-        <div class="prediction-confidence {confidence_class}">
-            Confidence<br>{prediction['confidence']:.1f}%
-        </div>
-        """, unsafe_allow_html=True)
-
-    with col2:
-        st.metric("Current Price", f"${prediction['current_price']:.2f}", 
-                 f"{prediction['expected_change']:+.2f}%")
-
-    with col3:
-        st.metric("Avg Sentiment", f"{prediction['avg_sentiment']:.2f}", 
-                 "Positive" if prediction['avg_sentiment'] > 0 else "Negative")
-
-    with col4:
-        st.metric("Signal", prediction['signal'], 
-                 "📈" if "BUY" in prediction['signal'] else "📉" if "SELL" in prediction['signal'] else "➡️")
-
-    # Charts
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 Price Chart", "😊 Sentiment", "📊 Technical", "🚨 Alerts"])
+    # Tabs for analysis & simulator
+    tab1, tab2 = st.tabs(["📊 Analysis", "🕹️ Simulator"])
 
     with tab1:
-        # Candlestick chart
-        fig = go.Figure()
+        colA, colB, colC = st.columns(3)
+        colA.metric("Signal", pred['signal'])
+        colB.metric("Confidence", f"{pred['confidence']:.1f}%")
+        colC.metric("Expected Move", f"{pred['expected_change']:+.2f}%")
 
-        fig.add_trace(go.Candlestick(
-            x=stock_data['Date'],
-            open=stock_data['Open'],
-            high=stock_data['High'],
-            low=stock_data['Low'],
-            close=stock_data['Close'],
-            name="Price"
-        ))
-
-        # Add moving averages
-        fig.add_trace(go.Scatter(
-            x=stock_data['Date'], y=stock_data['SMA_20'],
-            mode='lines', name='SMA 20', line=dict(color='orange', width=1)
-        ))
-
-        fig.add_trace(go.Scatter(
-            x=stock_data['Date'], y=stock_data['SMA_50'],
-            mode='lines', name='SMA 50', line=dict(color='red', width=1)
-        ))
-
-        fig.update_layout(
-            title=f"{selected_stock} - Candlestick Chart with Moving Averages",
-            xaxis_title="Date",
-            yaxis_title="Price ($)",
-            height=500,
-            showlegend=True
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
+        # RSI chart
+        rsi = predictor._rsi(data['Close']).fillna(50)
+        rsi_fig = go.Figure()
+        rsi_fig.add_trace(go.Scatter(x=data['Date'], y=rsi, name='RSI'))
+        rsi_fig.add_hline(y=70, line_color='red', line_dash='dash')
+        rsi_fig.add_hline(y=30, line_color='green', line_dash='dash')
+        rsi_fig.update_layout(height=250, margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(rsi_fig, use_container_width=True)
 
     with tab2:
-        # Sentiment heatmap
-        sentiment_pivot = sentiment_data.pivot_table(
-            values='Sentiment', index='Source', 
-            columns=sentiment_data['Date'].dt.day, aggfunc='mean'
-        )
+        st.write("### Run Simple Portfolio Simulator (100k USD)")
+        if st.button("Run Simulator"):
+            with st.spinner("Simulating..."):
+                sim = PortfolioSimulator(['TSLA', 'NVDA', 'GOOGL', 'MSFT', 'AMZN'])
+                final_value = sim.run(period='6mo')
+                profit = final_value - sim.initial_cash
+                st.success(f"Final Portfolio Value: ${final_value:,.2f}  (Profit: ${profit:,.2f})")
+                if profit > 0:
+                    st.balloons()
+                # Show simple trade log last 10
+                if sim.history:
+                    hist_df = pd.DataFrame(sim.history, columns=['Date', 'Symbol', 'Action', 'Price', 'Qty'])
+                    st.dataframe(hist_df.tail(10))
 
-        fig = px.imshow(
-            sentiment_pivot,
-            color_continuous_scale='RdYlGn',
-            color_continuous_midpoint=0,
-            title="Social Media Sentiment Heatmap"
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Sentiment trends
-        sentiment_trends = sentiment_data.groupby(['Date', 'Source'])['Sentiment'].mean().reset_index()
-        fig = px.line(
-            sentiment_trends, x='Date', y='Sentiment', color='Source',
-            title="Sentiment Trends by Source"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    with tab3:
-        # Technical indicators
-        fig = make_subplots(
-            rows=3, cols=1,
-            subplot_titles=('RSI', 'MACD', 'Bollinger Bands'),
-            vertical_spacing=0.1
-        )
-
-        # RSI
-        fig.add_trace(go.Scatter(
-            x=stock_data['Date'], y=stock_data['RSI'],
-            mode='lines', name='RSI'
-        ), row=1, col=1)
-        fig.add_hline(y=70, line_dash="dash", line_color="red", row=1, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", row=1, col=1)
-
-        # MACD
-        fig.add_trace(go.Scatter(
-            x=stock_data['Date'], y=stock_data['MACD'],
-            mode='lines', name='MACD'
-        ), row=2, col=1)
-        fig.add_trace(go.Scatter(
-            x=stock_data['Date'], y=stock_data['MACD_Signal'],
-            mode='lines', name='Signal'
-        ), row=2, col=1)
-
-        # Bollinger Bands
-        fig.add_trace(go.Scatter(
-            x=stock_data['Date'], y=stock_data['BB_Upper'],
-            mode='lines', name='BB Upper', line=dict(color='red', dash='dash')
-        ), row=3, col=1)
-        fig.add_trace(go.Scatter(
-            x=stock_data['Date'], y=stock_data['Close'],
-            mode='lines', name='Close Price'
-        ), row=3, col=1)
-        fig.add_trace(go.Scatter(
-            x=stock_data['Date'], y=stock_data['BB_Lower'],
-            mode='lines', name='BB Lower', line=dict(color='green', dash='dash')
-        ), row=3, col=1)
-
-        fig.update_layout(height=800, showlegend=True)
-        st.plotly_chart(fig, use_container_width=True)
-
-    with tab4:
-        # Alerts and recommendations
-        st.subheader("🚨 Trading Alerts")
-
-        alerts = []
-
-        # Generate alerts based on conditions
-        if prediction['confidence'] > 80:
-            alerts.append({
-                'type': 'HIGH_CONFIDENCE',
-                'message': f"High confidence {prediction['signal']} signal detected",
-                'urgency': 'HIGH'
-            })
-
-        if abs(prediction['expected_change']) > 2:
-            alerts.append({
-                'type': 'LARGE_MOVE',
-                'message': f"Expected large price movement: {prediction['expected_change']:+.1f}%",
-                'urgency': 'MEDIUM'
-            })
-
-        if prediction['avg_sentiment'] > 0.3:
-            alerts.append({
-                'type': 'POSITIVE_SENTIMENT',
-                'message': "Strong positive sentiment across social media",
-                'urgency': 'MEDIUM'
-            })
-        elif prediction['avg_sentiment'] < -0.3:
-            alerts.append({
-                'type': 'NEGATIVE_SENTIMENT',
-                'message': "Strong negative sentiment across social media",
-                'urgency': 'MEDIUM'
-            })
-
-        if not alerts:
-            st.info("No alerts at this time. Market conditions appear normal.")
-        else:
-            for alert in alerts:
-                if alert['urgency'] == 'HIGH':
-                    st.error(f"🔴 {alert['message']}")
-                elif alert['urgency'] == 'MEDIUM':
-                    st.warning(f"🟡 {alert['message']}")
-                else:
-                    st.info(f"🔵 {alert['message']}")
-
-        # Risk assessment
-        st.subheader("⚖️ Risk Assessment")
-
-        risk_score = abs(prediction['expected_change']) + (100 - prediction['confidence']) / 100
-
-        if risk_score < 1:
-            st.success("🟢 LOW RISK - Conservative position recommended")
-        elif risk_score < 3:
-            st.warning("🟡 MEDIUM RISK - Standard position sizing")
-        else:
-            st.error("🔴 HIGH RISK - Reduce position size or avoid")
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # Footer
-    st.markdown("---")
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.caption(f"Last Updated: {datetime.now().strftime('%H:%M:%S')}")
-
-    with col2:
-        st.caption(f"Analyzing: {selected_stock}")
-
-    with col3:
-        st.caption("🤖 AI-Powered Predictions")
-
-    # Auto refresh
-    if auto_refresh:
-        time.sleep(5)
-        st.rerun()
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
